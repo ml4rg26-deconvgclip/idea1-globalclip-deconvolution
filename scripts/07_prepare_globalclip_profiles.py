@@ -105,6 +105,39 @@ def get_signal(sample: dict[str, Any], condition: str, *, target_len: int) -> to
     raise ValueError(f"Expected signal shape [L], [1, L], or [N, L], got {tuple(dense.shape)}")
 
 
+def standardize_signal(signal: torch.Tensor, *, target_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return signal, valid_mask, valid_lengths with signal shaped [tracks, target_len]."""
+    torch = require_torch()
+
+    if target_len <= 0:
+        raise ValueError(f"target_len must be positive, got {target_len}")
+
+    if signal.ndim == 1:
+        signal = signal.unsqueeze(0)
+    if signal.ndim != 2:
+        raise ValueError(f"Expected signal shape [L] or [tracks, L], got {tuple(signal.shape)}")
+
+    tracks, length = signal.shape
+    if length > target_len:
+        raise ValueError(
+            f"Signal length {length} exceeds target_len={target_len}; "
+            "refusing to truncate raw globalCLIP counts."
+        )
+
+    valid_mask = torch.zeros((tracks, target_len), dtype=torch.bool, device=signal.device)
+    if length > 0:
+        valid_mask[:, :length] = True
+
+    valid_lengths = torch.full((tracks,), length, dtype=torch.long, device=signal.device)
+    if length == target_len:
+        return signal, valid_mask, valid_lengths
+
+    padded = torch.zeros((tracks, target_len), dtype=signal.dtype, device=signal.device)
+    if length > 0:
+        padded[:, :length] = signal
+    return padded, valid_mask, valid_lengths
+
+
 def sample_name(sample: dict[str, Any], fallback: str) -> str:
     meta = sample.get("meta", {})
     if isinstance(meta, dict) and "name" in meta:
@@ -174,9 +207,12 @@ def main() -> None:
 
     profiles = []
     total_counts = []
+    valid_masks = []
+    valid_lengths = []
     split_names = []
     indices = []
     names = []
+    expected_tracks = None
 
     print(f"Preparing condition: {args.condition}")
     print(f"Selected windows: {len(rows)}")
@@ -184,21 +220,38 @@ def main() -> None:
 
     for split, index, sample in rows:
         signal = get_signal(sample, args.condition, target_len=args.target_len)
-        profile = counts_to_profile(signal, eps=args.eps, length_axis=-1)
+        signal, valid_mask, sample_valid_lengths = standardize_signal(signal, target_len=args.target_len)
+
+        if expected_tracks is None:
+            expected_tracks = signal.shape[0]
+        elif signal.shape[0] != expected_tracks:
+            raise ValueError(
+                f"Inconsistent track count at {split}[{index}]: got {signal.shape[0]}, "
+                f"expected {expected_tracks}."
+            )
+
+        profile = counts_to_profile(signal, eps=args.eps, length_axis=-1, mask=valid_mask)
 
         profiles.append(profile.detach().cpu().to(dtype=torch.float32))
         total_counts.append(signal.detach().cpu().float().sum(dim=-1))
+        valid_masks.append(valid_mask.detach().cpu())
+        valid_lengths.append(sample_valid_lengths.detach().cpu())
         split_names.append(split)
         indices.append(index)
         names.append(sample_name(sample, f"{split}[{index}]"))
 
     profile_tensor = torch.stack(profiles, dim=0)
     total_counts_tensor = torch.stack(total_counts, dim=0)
+    valid_mask_tensor = torch.stack(valid_masks, dim=0)
+    valid_lengths_tensor = torch.stack(valid_lengths, dim=0)
     profile_sums = profile_tensor.sum(dim=-1)
+    padded_windows = int((valid_lengths_tensor < args.target_len).any(dim=-1).sum().item())
 
     output = {
         "profiles": profile_tensor,
         "total_counts": total_counts_tensor,
+        "valid_mask": valid_mask_tensor,
+        "valid_lengths": valid_lengths_tensor,
         "condition": args.condition,
         "eps": args.eps,
         "length_axis": -1,
@@ -214,6 +267,10 @@ def main() -> None:
             "profile_sum_min": float(profile_sums.min().item()),
             "profile_sum_mean": float(profile_sums.mean().item()),
             "profile_sum_max": float(profile_sums.max().item()),
+            "valid_length_min": int(valid_lengths_tensor.min().item()),
+            "valid_length_mean": float(valid_lengths_tensor.float().mean().item()),
+            "valid_length_max": int(valid_lengths_tensor.max().item()),
+            "padded_windows": padded_windows,
             "total_count_min": float(total_counts_tensor.min().item()),
             "total_count_mean": float(total_counts_tensor.float().mean().item()),
             "total_count_max": float(total_counts_tensor.max().item()),
@@ -237,6 +294,11 @@ def main() -> None:
     print(f"  min:  {profile_sums.min().item():.8f}")
     print(f"  mean: {profile_sums.mean().item():.8f}")
     print(f"  max:  {profile_sums.max().item():.8f}")
+    print("Valid lengths:")
+    print(f"  min:            {valid_lengths_tensor.min().item()}")
+    print(f"  mean:           {valid_lengths_tensor.float().mean().item():.2f}")
+    print(f"  max:            {valid_lengths_tensor.max().item()}")
+    print(f"  padded windows: {padded_windows}")
     print("Total counts per window:")
     print(f"  shape: {tuple(total_counts_tensor.shape)}")
     print(f"  min:   {total_counts_tensor.min().item():.6g}")

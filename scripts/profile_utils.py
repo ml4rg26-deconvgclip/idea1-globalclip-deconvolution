@@ -103,24 +103,63 @@ def _torch_counts_to_profile(counts: Any, *, eps: float, length_axis: int, mask:
 
 
 def _self_test() -> None:
-    import numpy as np
-
-    counts = np.array([[0, 0, 0], [1, 2, 3]], dtype=np.float32)
-    profile = counts_to_profile(counts, eps=1e-6)
-
-    if not np.allclose(profile.sum(axis=-1), 1.0):
-        raise AssertionError("profile rows do not sum to 1")
-    if not np.isfinite(profile).all():
-        raise AssertionError("profile contains NaN or inf")
-    if not (profile >= 0).all():
-        raise AssertionError("profile contains negative values")
-
     try:
-        counts_to_profile(np.array([[0.0, -1.0, 2.0]]))
-    except ValueError:
-        pass
+        import torch
+    except ImportError:
+        torch = None
+
+    if torch is not None:
+        counts = torch.tensor([[0, 0, 0], [1, 2, 3]], dtype=torch.float32)
+        profile = counts_to_profile(counts, eps=1e-6)
+
+        if not torch.allclose(profile.sum(dim=-1), torch.ones(2, dtype=profile.dtype)):
+            raise AssertionError("profile rows do not sum to 1")
+        if not torch.isfinite(profile).all():
+            raise AssertionError("profile contains NaN or inf")
+        if not (profile >= 0).all():
+            raise AssertionError("profile contains negative values")
+
+        try:
+            counts_to_profile(torch.tensor([[0.0, -1.0, 2.0]]))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("negative counts were not rejected")
+
+        padded_counts = torch.tensor([[1.0, 2.0, 0.0, 0.0]])
+        valid_mask = torch.tensor([[True, True, False, False]])
+        masked_profile = counts_to_profile(padded_counts, eps=1e-6, mask=valid_mask)
+        if masked_profile[0, 2:].abs().sum().item() != 0.0:
+            raise AssertionError("masked padded positions are not exactly zero")
+        if not torch.allclose(masked_profile.sum(dim=-1), torch.ones(1, dtype=masked_profile.dtype)):
+            raise AssertionError("masked profile row does not sum to 1")
     else:
-        raise AssertionError("negative counts were not rejected")
+        import numpy as np
+
+        counts = np.array([[0, 0, 0], [1, 2, 3]], dtype=np.float32)
+        profile = counts_to_profile(counts, eps=1e-6)
+
+        if not np.allclose(profile.sum(axis=-1), 1.0):
+            raise AssertionError("profile rows do not sum to 1")
+        if not np.isfinite(profile).all():
+            raise AssertionError("profile contains NaN or inf")
+        if not (profile >= 0).all():
+            raise AssertionError("profile contains negative values")
+
+        try:
+            counts_to_profile(np.array([[0.0, -1.0, 2.0]]))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("negative counts were not rejected")
+
+        padded_counts = np.array([[1.0, 2.0, 0.0, 0.0]])
+        valid_mask = np.array([[True, True, False, False]])
+        masked_profile = counts_to_profile(padded_counts, eps=1e-6, mask=valid_mask)
+        if masked_profile[0, 2:].sum() != 0.0:
+            raise AssertionError("masked padded positions are not exactly zero")
+        if not np.allclose(masked_profile.sum(axis=-1), 1.0):
+            raise AssertionError("masked profile row does not sum to 1")
 
     print("profile_utils self-test passed")
 
