@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,30 @@ def require_torch() -> Any:
     except ImportError as exc:
         raise SystemExit("PyTorch is required to load and save .pt globalCLIP files.") from exc
     return torch
+
+
+def load_infer_pad_sizes() -> Any:
+    try:
+        from parnet_demo_utils import infer_pad_sizes
+    except ImportError:
+        project_root = Path(__file__).resolve().parent.parent
+        candidates = [
+            project_root.parent / "parnet--demo--train-models" / "src",
+            project_root.parent.parent / "parnet--demo--train-models" / "src",
+        ]
+        for candidate in candidates:
+            if candidate.exists() and str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+                try:
+                    from parnet_demo_utils import infer_pad_sizes
+                except ImportError:
+                    continue
+                return infer_pad_sizes
+        raise SystemExit(
+            "parnet_demo_utils is required for infer_pad_sizes. Install the sibling "
+            "parnet--demo--train-models package or run with its src directory on PYTHONPATH."
+        )
+    return infer_pad_sizes
 
 
 def sparse_dict_to_dense(x: Any, *, target_len: int = 600) -> torch.Tensor:
@@ -105,8 +130,15 @@ def get_signal(sample: dict[str, Any], condition: str, *, target_len: int) -> to
     raise ValueError(f"Expected signal shape [L], [1, L], or [N, L], got {tuple(dense.shape)}")
 
 
-def standardize_signal(signal: torch.Tensor, *, target_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return signal, valid_mask, valid_lengths with signal shaped [tracks, target_len]."""
+def standardize_signal(
+    signal: torch.Tensor,
+    *,
+    target_len: int,
+    name: str,
+    pad_side: int,
+    infer_pad_sizes: Any,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Return signal/mask/lengths with signal shaped [tracks, target_len]."""
     torch = require_torch()
 
     if target_len <= 0:
@@ -120,29 +152,51 @@ def standardize_signal(signal: torch.Tensor, *, target_len: int) -> tuple[torch.
     tracks, length = signal.shape
     if length > target_len:
         raise ValueError(
-            f"Signal length {length} exceeds target_len={target_len}; "
+            f"{name}: signal length {length} exceeds target_len={target_len}; "
             "refusing to truncate raw globalCLIP counts."
         )
 
+    left_pad = 0
+    right_pad = 0
     valid_mask = torch.zeros((tracks, target_len), dtype=torch.bool, device=signal.device)
+    if length == target_len:
+        valid_mask[:, :] = True
+        valid_lengths = torch.full((tracks,), length, dtype=torch.long, device=signal.device)
+        return signal, valid_mask, valid_lengths, left_pad, right_pad
+
+    left_pad, right_pad = infer_pad_sizes(name, pad_side, target_len)
+    if left_pad < 0 or right_pad < 0:
+        raise ValueError(
+            f"{name}: infer_pad_sizes returned negative padding: "
+            f"left_pad={left_pad}, right_pad={right_pad}, pad_side={pad_side}."
+        )
+    if left_pad + length + right_pad != target_len:
+        raise ValueError(
+            f"{name}: inferred padding does not match target_len={target_len}. "
+            f"signal_length={length}, pad_side={pad_side}, "
+            f"left_pad={left_pad}, right_pad={right_pad}, "
+            f"sum={left_pad + length + right_pad}."
+        )
+
     if length > 0:
-        valid_mask[:, :length] = True
+        valid_mask[:, left_pad : left_pad + length] = True
 
     valid_lengths = torch.full((tracks,), length, dtype=torch.long, device=signal.device)
-    if length == target_len:
-        return signal, valid_mask, valid_lengths
-
     padded = torch.zeros((tracks, target_len), dtype=signal.dtype, device=signal.device)
     if length > 0:
-        padded[:, :length] = signal
-    return padded, valid_mask, valid_lengths
+        padded[:, left_pad : left_pad + length] = signal
+    return padded, valid_mask, valid_lengths, left_pad, right_pad
 
 
-def sample_name(sample: dict[str, Any], fallback: str) -> str:
+def sample_metadata(sample: dict[str, Any], fallback: str) -> tuple[str, int]:
     meta = sample.get("meta", {})
-    if isinstance(meta, dict) and "name" in meta:
-        return str(meta["name"])
-    return fallback
+    if not isinstance(meta, dict):
+        raise KeyError(f"{fallback}: sample is missing dict field: meta")
+    if "name" not in meta:
+        raise KeyError(f"{fallback}: sample['meta'] is missing required key: name")
+    if "pad_side" not in meta:
+        raise KeyError(f"{fallback}: sample['meta'] is missing required key: pad_side")
+    return str(meta["name"]), int(meta["pad_side"])
 
 
 def parse_args() -> argparse.Namespace:
@@ -196,6 +250,7 @@ def main() -> None:
         raise SystemExit("--limit must be non-negative")
 
     torch = require_torch()
+    infer_pad_sizes = load_infer_pad_sizes()
 
     print(f"Loading: {args.input_pt}")
     data = torch.load(args.input_pt, map_location="cpu", weights_only=False)
@@ -209,6 +264,9 @@ def main() -> None:
     total_counts = []
     valid_masks = []
     valid_lengths = []
+    left_pads = []
+    right_pads = []
+    pad_sides = []
     split_names = []
     indices = []
     names = []
@@ -219,8 +277,16 @@ def main() -> None:
     print(f"eps: {args.eps:g}")
 
     for split, index, sample in rows:
+        fallback = f"{split}[{index}]"
+        name, pad_side = sample_metadata(sample, fallback)
         signal = get_signal(sample, args.condition, target_len=args.target_len)
-        signal, valid_mask, sample_valid_lengths = standardize_signal(signal, target_len=args.target_len)
+        signal, valid_mask, sample_valid_lengths, left_pad, right_pad = standardize_signal(
+            signal,
+            target_len=args.target_len,
+            name=name,
+            pad_side=pad_side,
+            infer_pad_sizes=infer_pad_sizes,
+        )
 
         if expected_tracks is None:
             expected_tracks = signal.shape[0]
@@ -236,14 +302,20 @@ def main() -> None:
         total_counts.append(signal.detach().cpu().float().sum(dim=-1))
         valid_masks.append(valid_mask.detach().cpu())
         valid_lengths.append(sample_valid_lengths.detach().cpu())
+        left_pads.append(left_pad)
+        right_pads.append(right_pad)
+        pad_sides.append(pad_side)
         split_names.append(split)
         indices.append(index)
-        names.append(sample_name(sample, f"{split}[{index}]"))
+        names.append(name)
 
     profile_tensor = torch.stack(profiles, dim=0)
     total_counts_tensor = torch.stack(total_counts, dim=0)
     valid_mask_tensor = torch.stack(valid_masks, dim=0)
     valid_lengths_tensor = torch.stack(valid_lengths, dim=0)
+    left_pad_tensor = torch.tensor(left_pads, dtype=torch.long)
+    right_pad_tensor = torch.tensor(right_pads, dtype=torch.long)
+    pad_side_tensor = torch.tensor(pad_sides, dtype=torch.long)
     profile_sums = profile_tensor.sum(dim=-1)
     padded_windows = int((valid_lengths_tensor < args.target_len).any(dim=-1).sum().item())
 
@@ -252,6 +324,9 @@ def main() -> None:
         "total_counts": total_counts_tensor,
         "valid_mask": valid_mask_tensor,
         "valid_lengths": valid_lengths_tensor,
+        "left_pad": left_pad_tensor,
+        "right_pad": right_pad_tensor,
+        "pad_side": pad_side_tensor,
         "condition": args.condition,
         "eps": args.eps,
         "length_axis": -1,
@@ -270,6 +345,12 @@ def main() -> None:
             "valid_length_min": int(valid_lengths_tensor.min().item()),
             "valid_length_mean": float(valid_lengths_tensor.float().mean().item()),
             "valid_length_max": int(valid_lengths_tensor.max().item()),
+            "left_pad_min": int(left_pad_tensor.min().item()),
+            "left_pad_mean": float(left_pad_tensor.float().mean().item()),
+            "left_pad_max": int(left_pad_tensor.max().item()),
+            "right_pad_min": int(right_pad_tensor.min().item()),
+            "right_pad_mean": float(right_pad_tensor.float().mean().item()),
+            "right_pad_max": int(right_pad_tensor.max().item()),
             "padded_windows": padded_windows,
             "total_count_min": float(total_counts_tensor.min().item()),
             "total_count_mean": float(total_counts_tensor.float().mean().item()),
@@ -299,6 +380,14 @@ def main() -> None:
     print(f"  mean:           {valid_lengths_tensor.float().mean().item():.2f}")
     print(f"  max:            {valid_lengths_tensor.max().item()}")
     print(f"  padded windows: {padded_windows}")
+    print("Left padding:")
+    print(f"  min:  {left_pad_tensor.min().item()}")
+    print(f"  mean: {left_pad_tensor.float().mean().item():.2f}")
+    print(f"  max:  {left_pad_tensor.max().item()}")
+    print("Right padding:")
+    print(f"  min:  {right_pad_tensor.min().item()}")
+    print(f"  mean: {right_pad_tensor.float().mean().item():.2f}")
+    print(f"  max:  {right_pad_tensor.max().item()}")
     print("Total counts per window:")
     print(f"  shape: {tuple(total_counts_tensor.shape)}")
     print(f"  min:   {total_counts_tensor.min().item():.6g}")
