@@ -23,10 +23,12 @@ from smoke_test_parnet import (
 
 DEFAULT_SPLITS = ("train", "valid", "test")
 BASE_TO_CHANNEL = {"A": 0, "C": 1, "G": 2, "T": 3, "U": 3}
-OPTIONAL_OUTPUT_KEYS = {
-    "target": "parnet_target",
-    "control": "parnet_control",
-    "mix_coeff": "mix_coeff",
+TRACKS = ("total", "target", "control")
+OUTPUT_SPACES = ("prob", "logprob", "both")
+TRACK_OUTPUT_ALIASES = {
+    "total": ("total",),
+    "target": ("target", "parnet_target"),
+    "control": ("control", "parnet_control"),
 }
 
 
@@ -83,6 +85,29 @@ def parse_args() -> argparse.Namespace:
         "--output-name",
         default=None,
         help="Optional output filename. Defaults to <condition-name>_parnet_predictions.pt.",
+    )
+    parser.add_argument(
+        "--output-track",
+        choices=(*TRACKS, "all"),
+        default="total",
+        help="PARNET output track to save. Default saves only total to limit output size.",
+    )
+    parser.add_argument(
+        "--output-space",
+        choices=OUTPUT_SPACES,
+        default="prob",
+        help="Save probability profiles, raw log probabilities, or both.",
+    )
+    parser.add_argument(
+        "--save-mix-coeff",
+        action="store_true",
+        help="Save out['mix_coeff'] when available. Disabled by default to save space.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("float32", "float16"),
+        default="float16",
+        help="Dtype for saved prediction tensors.",
     )
     parser.add_argument("--target-len", type=int, default=600, help="PARNET input length.")
     parser.add_argument(
@@ -219,11 +244,98 @@ def count_unknown_bases(sequences: list[str]) -> Counter[str]:
     return counts
 
 
-def validate_total_output(total: Any, *, batch_size: int, profile_count: int, target_len: int) -> None:
-    observed_shape = tuple(total.shape)
+def validate_track_output(
+    value: Any,
+    *,
+    track: str,
+    batch_size: int,
+    profile_count: int,
+    target_len: int,
+) -> None:
+    observed_shape = tuple(value.shape)
     expected_shape = (batch_size, profile_count, target_len)
     if observed_shape != expected_shape:
-        raise ValueError(f"Expected out['total'] shape {expected_shape}, observed {observed_shape}")
+        raise ValueError(f"Expected out[{track!r}] shape {expected_shape}, observed {observed_shape}")
+
+
+def validate_mix_coeff_output(value: Any, *, batch_size: int, profile_count: int) -> None:
+    observed_shape = tuple(value.shape)
+    expected_shape = (batch_size, profile_count)
+    if observed_shape != expected_shape:
+        raise ValueError(f"Expected out['mix_coeff'] shape {expected_shape}, observed {observed_shape}")
+
+
+def selected_tracks(output_track: str) -> list[str]:
+    return list(TRACKS) if output_track == "all" else [output_track]
+
+
+def selected_spaces(output_space: str) -> list[str]:
+    if output_space == "both":
+        return ["prob", "logprob"]
+    return [output_space]
+
+
+def saved_dtype(torch: Any, dtype_name: str) -> Any:
+    return {"float32": torch.float32, "float16": torch.float16}[dtype_name]
+
+
+def saved_prediction_key(track: str, space: str) -> str:
+    suffix = "profile" if space == "prob" else "logprob"
+    return f"parnet_{track}_{suffix}"
+
+
+def resolve_track_output(out: dict[str, Any], track: str) -> tuple[str, Any]:
+    for key in TRACK_OUTPUT_ALIASES[track]:
+        if key in out:
+            return key, out[key]
+    raise KeyError(
+        f"Expected one of {TRACK_OUTPUT_ALIASES[track]} for output track {track!r}; "
+        f"observed keys: {list(out.keys())}"
+    )
+
+
+def profile_sum_stats(tensor: Any, *, chunk_size: int = 128) -> dict[str, float]:
+    torch = require_torch()
+    min_value = float("inf")
+    max_value = float("-inf")
+    total = 0.0
+    count = 0
+
+    for start in range(0, tensor.shape[0], chunk_size):
+        sums = tensor[start : start + chunk_size].to(dtype=torch.float32).sum(dim=-1)
+        min_value = min(min_value, float(sums.min().item()))
+        max_value = max(max_value, float(sums.max().item()))
+        total += float(sums.sum().item())
+        count += sums.numel()
+
+    return {
+        "min": min_value,
+        "mean": total / count,
+        "max": max_value,
+    }
+
+
+def summarize_saved_outputs(saved_outputs: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key, value in saved_outputs.items():
+        summary[f"{key}_shape"] = tuple(value.shape)
+        summary[f"{key}_saved_dtype"] = str(value.dtype)
+
+        if key.endswith("_logprob"):
+            summary[f"{key}_logprob_min"] = float(value.min().item())
+            summary[f"{key}_logprob_max"] = float(value.max().item())
+        elif key.endswith("_profile"):
+            summary[f"{key}_profile_min"] = float(value.min().item())
+            summary[f"{key}_profile_max"] = float(value.max().item())
+            sums = profile_sum_stats(value)
+            summary[f"{key}_profile_sum_min"] = sums["min"]
+            summary[f"{key}_profile_sum_mean"] = sums["mean"]
+            summary[f"{key}_profile_sum_max"] = sums["max"]
+        elif key == "mix_coeff":
+            summary[f"{key}_min"] = float(value.min().item())
+            summary[f"{key}_max"] = float(value.max().item())
+
+    return summary
 
 
 def prepare_sequences(
@@ -329,11 +441,27 @@ def main() -> None:
     model.eval()
 
     sample_count = len(sequences)
-    parnet_total = torch.empty((sample_count, profile_count, args.target_len), dtype=torch.float32)
-    optional_outputs: dict[str, Any] = {}
-    expected_optional_keys: set[str] | None = None
+    tracks_to_save = selected_tracks(args.output_track)
+    spaces_to_save = selected_spaces(args.output_space)
+    prediction_dtype = saved_dtype(torch, args.dtype)
+    saved_outputs = {
+        saved_prediction_key(track, space): torch.empty(
+            (sample_count, profile_count, args.target_len),
+            dtype=prediction_dtype,
+        )
+        for track in tracks_to_save
+        for space in spaces_to_save
+    }
+    if args.save_mix_coeff:
+        saved_outputs["mix_coeff"] = torch.empty(
+            (sample_count, profile_count),
+            dtype=prediction_dtype,
+        )
 
     print(f"Running inference in batches of {args.batch_size}")
+    print(f"Saving tracks: {', '.join(tracks_to_save)}")
+    print(f"Saving spaces: {', '.join(spaces_to_save)}")
+    print(f"Saved prediction dtype: {prediction_dtype}")
     with torch.no_grad():
         for start in range(0, sample_count, args.batch_size):
             end = min(start + args.batch_size, sample_count)
@@ -343,68 +471,57 @@ def main() -> None:
 
             if not isinstance(out, dict):
                 raise TypeError(f"Expected model output dict, got {type(out).__name__}")
-            if "total" not in out:
-                raise KeyError(f"Expected output key 'total'; observed keys: {list(out.keys())}")
 
-            validate_total_output(
-                out["total"],
-                batch_size=end - start,
-                profile_count=profile_count,
-                target_len=args.target_len,
-            )
-            parnet_total[start:end] = out["total"].detach().cpu().to(dtype=torch.float32)
-
-            observed_optional_keys = {
-                source_key for source_key in OPTIONAL_OUTPUT_KEYS if source_key in out
-            }
-            if expected_optional_keys is None:
-                expected_optional_keys = observed_optional_keys
-            elif observed_optional_keys != expected_optional_keys:
-                raise ValueError(
-                    "Inconsistent optional PARNET output keys across batches: "
-                    f"expected {sorted(expected_optional_keys)}, observed {sorted(observed_optional_keys)}"
+            for track in tracks_to_save:
+                source_key, logprob = resolve_track_output(out, track)
+                validate_track_output(
+                    logprob,
+                    track=source_key,
+                    batch_size=end - start,
+                    profile_count=profile_count,
+                    target_len=args.target_len,
                 )
 
-            for source_key, saved_key in OPTIONAL_OUTPUT_KEYS.items():
-                if source_key not in out:
-                    continue
-                value = out[source_key].detach().cpu().to(dtype=torch.float32)
-                if value.shape[0] != end - start:
-                    raise ValueError(
-                        f"Expected out[{source_key!r}] batch dimension {end - start}, "
-                        f"observed {tuple(value.shape)}"
+                if "logprob" in spaces_to_save:
+                    saved_outputs[saved_prediction_key(track, "logprob")][start:end] = (
+                        logprob.detach().cpu().to(dtype=prediction_dtype)
                     )
-                if saved_key not in optional_outputs:
-                    optional_outputs[saved_key] = torch.empty(
-                        (sample_count, *value.shape[1:]),
-                        dtype=torch.float32,
+
+                if "prob" in spaces_to_save:
+                    saved_outputs[saved_prediction_key(track, "prob")][start:end] = (
+                        logprob.exp().detach().cpu().to(dtype=prediction_dtype)
                     )
-                optional_outputs[saved_key][start:end] = value
+
+            if args.save_mix_coeff:
+                if "mix_coeff" not in out:
+                    raise KeyError(f"Expected output key 'mix_coeff'; observed keys: {list(out.keys())}")
+                validate_mix_coeff_output(
+                    out["mix_coeff"],
+                    batch_size=end - start,
+                    profile_count=profile_count,
+                )
+                saved_outputs["mix_coeff"][start:end] = (
+                    out["mix_coeff"].detach().cpu().to(dtype=prediction_dtype)
+                )
 
             batch_number = (start // args.batch_size) + 1
             batch_count = (sample_count + args.batch_size - 1) // args.batch_size
             if batch_number == 1 or batch_number == batch_count or batch_number % 10 == 0:
                 print(f"  batch {batch_number}/{batch_count}: windows {start}-{end - 1}")
 
-    total_sums = parnet_total.sum(dim=-1)
     summary = {
-        "parnet_total_shape": tuple(parnet_total.shape),
-        "parnet_total_dtype": str(parnet_total.dtype),
-        "parnet_total_min": float(parnet_total.min().item()),
-        "parnet_total_max": float(parnet_total.max().item()),
-        "parnet_total_sum_min": float(total_sums.min().item()),
-        "parnet_total_sum_mean": float(total_sums.mean().item()),
-        "parnet_total_sum_max": float(total_sums.max().item()),
+        "output_track": args.output_track,
+        "output_space": args.output_space,
+        "saved_tracks": tracks_to_save,
+        "saved_spaces": spaces_to_save,
+        "saved_dtype": args.dtype,
         "unknown_base_count": int(unknown_total),
         "unknown_base_counts": dict(sorted(unknown_counts.items())),
     }
-    for saved_key, value in optional_outputs.items():
-        summary[f"{saved_key}_shape"] = tuple(value.shape)
-        summary[f"{saved_key}_dtype"] = str(value.dtype)
+    summary.update(summarize_saved_outputs(saved_outputs))
 
     output = {
-        "parnet_total": parnet_total,
-        **optional_outputs,
+        **saved_outputs,
         "split": split_names,
         "index": torch.tensor(indices, dtype=torch.long),
         "name": names,
@@ -426,18 +543,23 @@ def main() -> None:
 
     torch.save(output, output_path)
 
-    print("\nObserved output shapes:")
-    print(f"  total: {output_shape(parnet_total)}")
-    for saved_key, value in optional_outputs.items():
+    print("\nSaved output shapes:")
+    for saved_key, value in saved_outputs.items():
         print(f"  {saved_key}: {output_shape(value)}")
-    print("PARNET total summary:")
-    print(f"  dtype: {parnet_total.dtype}")
-    print(f"  min:   {parnet_total.min().item():.6g}")
-    print(f"  max:   {parnet_total.max().item():.6g}")
-    print("PARNET total sums over length axis:")
-    print(f"  min:  {total_sums.min().item():.8f}")
-    print(f"  mean: {total_sums.mean().item():.8f}")
-    print(f"  max:  {total_sums.max().item():.8f}")
+        print(f"    dtype: {value.dtype}")
+        if saved_key.endswith("_profile"):
+            print(f"    min:   {summary[f'{saved_key}_profile_min']:.6g}")
+            print(f"    max:   {summary[f'{saved_key}_profile_max']:.6g}")
+            print("    sums over length axis:")
+            print(f"      min:  {summary[f'{saved_key}_profile_sum_min']:.8f}")
+            print(f"      mean: {summary[f'{saved_key}_profile_sum_mean']:.8f}")
+            print(f"      max:  {summary[f'{saved_key}_profile_sum_max']:.8f}")
+        elif saved_key.endswith("_logprob"):
+            print(f"    min:   {summary[f'{saved_key}_logprob_min']:.6g}")
+            print(f"    max:   {summary[f'{saved_key}_logprob_max']:.6g}")
+        elif saved_key == "mix_coeff":
+            print(f"    min:   {summary[f'{saved_key}_min']:.6g}")
+            print(f"    max:   {summary[f'{saved_key}_max']:.6g}")
     print(f"\nSaved: {output_path}")
 
 
