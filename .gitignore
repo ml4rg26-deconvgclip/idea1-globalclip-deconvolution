@@ -1,0 +1,11 @@
+data/
+models/
+results/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+__pycache__/
+.DS_Store
+.env

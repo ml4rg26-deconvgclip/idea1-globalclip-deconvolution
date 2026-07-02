@@ -1,0 +1,32 @@
+{
+  "paths": {
+    "data_dir": "data",
+    "globalclip_manifest": "data/globalclip/manifest.csv",
+    "globalclip_windows": "data/globalclip/windows.fa",
+    "globalclip_profiles": "data/globalclip/profiles",
+    "parnet_checkpoint": "models/parnet_pretrained.pt",
+    "parnet_predictions": "results/parnet_predictions.npz",
+    "reconstruction_checkpoint": "models/reconstruction_head.pt",
+    "evaluation_dir": "results/evaluation"
+  },
+  "model": {
+    "input_window_nt": 600,
+    "rbp_cell_line_profiles": 223,
+    "reconstruction_head": "linear"
+  },
+  "training": {
+    "seed": 13,
+    "batch_size": 32,
+    "learning_rate": 0.001,
+    "epochs": 0,
+    "num_workers": 0
+  },
+  "evaluation": {
+    "split": "validation",
+    "metrics": [
+      "pearson",
+      "spearman",
+      "mse"
+    ]
+  }
+}
