@@ -1,0 +1,30 @@
+{
+  "best_valid_loss": 5.606073519,
+  "test_reconstruction_head_loss": 5.6341254621,
+  "test_parnet_unweighted_average_loss": 5.8070402311,
+  "test_uniform_valid_profile_loss": 6.3778654136,
+  "top5_rbps": [
+    {
+      "rbp": "SND1",
+      "weight": 0.4745993614
+    },
+    {
+      "rbp": "YBX3",
+      "weight": 0.1667894686
+    },
+    {
+      "rbp": "PABPN1",
+      "weight": 0.1495774239
+    },
+    {
+      "rbp": "SRSF1",
+      "weight": 0.1454436570999999
+    },
+    {
+      "rbp": "LIN28B",
+      "weight": 0.0620824046
+    }
+  ],
+  "top5_rbp_weight_sum": 0.9984923156,
+  "top6_track_weight_sum": 0.9984638281
+}

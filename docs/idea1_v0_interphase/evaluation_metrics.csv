@@ -1,0 +1,13 @@
+split,model,loss
+train,reconstruction_head,5.6137160931
+train,uniform_valid_profile,6.3752624306
+train,parnet_unweighted_average,5.8127664443
+train,train_mean_observed_profile,6.3740619808
+valid,reconstruction_head,5.6060735190
+valid,uniform_valid_profile,6.3763033646
+valid,parnet_unweighted_average,5.8033311393
+valid,train_mean_observed_profile,6.3758368762
+test,reconstruction_head,5.6341254621
+test,uniform_valid_profile,6.3778654136
+test,parnet_unweighted_average,5.8070402311
+test,train_mean_observed_profile,6.3776165763
