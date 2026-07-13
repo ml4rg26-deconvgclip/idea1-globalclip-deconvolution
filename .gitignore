@@ -9,3 +9,7 @@ results/
 __pycache__/
 .DS_Store
 .env
+
+# Local result archives and VM audit logs
+*.tar.gz
+vm_audit_*.txt
