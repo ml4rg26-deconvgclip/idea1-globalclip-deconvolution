@@ -1,7 +1,7 @@
-# Idea 1 V0: interphase globalCLIP reconstruction
+# Idea 1 V0: globalclip_lysate_noNHS reconstruction
 
 ## Goal
-Use frozen Parnet-predicted 223 RBP-cell-line binding profiles to reconstruct the observed interphase globalCLIP profile with a small interpretable reconstruction head.
+Use frozen Parnet-predicted 223 RBP-cell-line binding profiles to reconstruct the observed `globalclip_lysate_noNHS_600bp_signalfiltered.pt` globalCLIP profile with a small interpretable reconstruction head.
 
 ## Data flow
 1. observed globalCLIP raw counts were normalized into per-window probability profiles
@@ -31,7 +31,7 @@ Validation and test results:
 - test uniform valid profile loss: 6.3779
 
 Interpretation:
-The learned reconstruction head outperforms the unweighted Parnet average and naive baselines, showing that some predicted RBP profiles are much more informative than others for reconstructing interphase globalCLIP.
+The learned reconstruction head outperforms the unweighted Parnet average and naive baselines, showing that some predicted RBP profiles are much more informative than others for reconstructing the `globalclip_lysate_noNHS` globalCLIP profile.
 
 ## Top track-level contributions
 Top tracks:
@@ -57,7 +57,7 @@ After aggregating weights across cell lines:
 Top 5 RBPs explain about 99.85% of the total learned weight.
 
 ## Main conclusion
-The V0 reconstruction head learns a highly sparse and interpretable mixture. Interphase globalCLIP can be reconstructed much better by emphasizing a very small subset of Parnet RBP tracks instead of treating all 223 tracks equally.
+The V0 reconstruction head learns a highly sparse and interpretable mixture. The `globalclip_lysate_noNHS` profile can be reconstructed much better by emphasizing a very small subset of Parnet RBP tracks instead of treating all 223 tracks equally.
 
 ## Limitations
 - this is a global-weight model, so the same mixture is used for all windows
@@ -69,4 +69,4 @@ The V0 reconstruction head learns a highly sparse and interpretable mixture. Int
 ## Minimal next steps
 1. use the generated plots in report_assets for presentation
 2. optionally inspect a few windows / peaks with top-RBP contributions
-3. optionally compare interphase and lysate later
+3. optionally compare this noNHS lysate run against additional conditions later
